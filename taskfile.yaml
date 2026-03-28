@@ -1,0 +1,56 @@
+version: "3"
+
+tasks:
+  default:
+    cmds:
+      - task: build
+
+  build:
+    desc: Build the agent binary
+    cmds:
+      - go build -ldflags "-X main.version={{.VERSION}}" -o bin/tidefly-agent ./cmd/tidefly-agent
+    vars:
+      VERSION:
+        sh: git describe --tags --always --dirty 2>/dev/null || echo "dev"
+
+  run:
+    desc: Run the agent locally (requires .env in project root)
+    cmds:
+      - go run ./cmd/tidefly-agent
+
+  dev:
+    desc: Run with debug logging
+    env:
+      LOG_LEVEL: debug
+    cmds:
+      - go run ./cmd/tidefly-agent
+
+  test:
+    desc: Run tests
+    cmds:
+      - go test ./...
+
+  lint:
+    desc: Run linter
+    cmds:
+      - golangci-lint run ./...
+
+  tidy:
+    desc: Tidy go modules
+    cmds:
+      - go mod tidy
+
+  build-all:
+    desc: Cross-compile for all supported platforms
+    cmds:
+      - GOOS=linux GOARCH=amd64  go build -ldflags "-X main.version={{.VERSION}}" -o bin/tidefly-agent_linux_amd64  ./cmd/tidefly-agent
+      - GOOS=linux GOARCH=arm64  go build -ldflags "-X main.version={{.VERSION}}" -o bin/tidefly-agent_linux_arm64  ./cmd/tidefly-agent
+      - GOOS=linux GOARCH=arm    go build -ldflags "-X main.version={{.VERSION}}" -o bin/tidefly-agent_linux_arm    ./cmd/tidefly-agent
+    vars:
+      VERSION:
+        sh: git describe --tags --always --dirty 2>/dev/null || echo "dev"
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf bin/
