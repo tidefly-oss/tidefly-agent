@@ -1,0 +1,11 @@
+services:
+  tidefly-agent:
+    image: ghcr.io/tidefly-oss/tidefly-agent:latest
+    container_name: tidefly-agent
+    restart: unless-stopped
+    env_file:
+      - /etc/tidefly-agent/.env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/tidefly-agent:/etc/tidefly-agent
+    network_mode: host

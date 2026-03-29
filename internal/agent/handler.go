@@ -11,7 +11,6 @@ import (
 	agentpb "github.com/tidefly-oss/tidefly-agent/internal/proto"
 )
 
-// CommandHandler processes PlaneMessages and sends results back via the stream.
 type CommandHandler struct {
 	cfg    *config.Config
 	stream agentpb.AgentService_ConnectClient
@@ -30,11 +29,8 @@ func NewCommandHandler(cfg *config.Config, stream agentpb.AgentService_ConnectCl
 
 func (h *CommandHandler) Handle(ctx context.Context, msg *agentpb.PlaneMessage) error {
 	slog.Debug("agent: received command", "command_id", msg.CommandId, "type", fmt.Sprintf("%T", msg.Payload))
-
 	switch p := msg.Payload.(type) {
-
 	case *agentpb.PlaneMessage_Ack:
-		// Plane acknowledged our hello
 		if !p.Ack.Accepted {
 			return fmt.Errorf("plane rejected connection: %s", p.Ack.Reason)
 		}
@@ -86,15 +82,17 @@ func (h *CommandHandler) handleListContainers(ctx context.Context, cmdID string)
 	if err != nil {
 		return h.sendError(cmdID, "LIST_CONTAINERS_FAILED", err.Error())
 	}
-	return h.stream.Send(&agentpb.AgentMessage{
-		MessageId: uuid.New().String(),
-		Payload: &agentpb.AgentMessage_ContainerList{
-			ContainerList: &agentpb.ContainerListResult{
-				CommandId:  cmdID,
-				Containers: containers,
+	return h.stream.Send(
+		&agentpb.AgentMessage{
+			MessageId: uuid.New().String(),
+			Payload: &agentpb.AgentMessage_ContainerList{
+				ContainerList: &agentpb.ContainerListResult{
+					CommandId:  cmdID,
+					Containers: containers,
+				},
 			},
 		},
-	})
+	)
 }
 
 func (h *CommandHandler) handleStartContainer(ctx context.Context, cmdID, containerID string) error {
@@ -134,18 +132,20 @@ func (h *CommandHandler) handleStreamLogs(ctx context.Context, cmdID string, cmd
 		return
 	}
 	for line := range logCh {
-		_ = h.stream.Send(&agentpb.AgentMessage{
-			MessageId: uuid.New().String(),
-			Payload: &agentpb.AgentMessage_ContainerLogs{
-				ContainerLogs: &agentpb.ContainerLogsResult{
-					CommandId:   cmdID,
-					ContainerId: cmd.ContainerId,
-					Line:        line.Text,
-					IsStderr:    line.IsStderr,
-					Timestamp:   time.Now().UnixMilli(),
+		_ = h.stream.Send(
+			&agentpb.AgentMessage{
+				MessageId: uuid.New().String(),
+				Payload: &agentpb.AgentMessage_ContainerLogs{
+					ContainerLogs: &agentpb.ContainerLogsResult{
+						CommandId:   cmdID,
+						ContainerId: cmd.ContainerId,
+						Line:        line.Text,
+						IsStderr:    line.IsStderr,
+						Timestamp:   time.Now().UnixMilli(),
+					},
 				},
 			},
-		})
+		)
 	}
 }
 
@@ -154,52 +154,58 @@ func (h *CommandHandler) handleStreamLogs(ctx context.Context, cmdID string, cmd
 func (h *CommandHandler) handleDeploy(ctx context.Context, cmdID string, cmd *agentpb.CmdDeploy) {
 	containerID, err := h.rt.Deploy(ctx, cmd)
 	if err != nil {
-		_ = h.stream.Send(&agentpb.AgentMessage{
+		_ = h.stream.Send(
+			&agentpb.AgentMessage{
+				MessageId: uuid.New().String(),
+				Payload: &agentpb.AgentMessage_DeployResult{
+					DeployResult: &agentpb.DeployResult{
+						CommandId: cmdID,
+						Success:   false,
+						Error:     err.Error(),
+					},
+				},
+			},
+		)
+		return
+	}
+	_ = h.stream.Send(
+		&agentpb.AgentMessage{
 			MessageId: uuid.New().String(),
 			Payload: &agentpb.AgentMessage_DeployResult{
 				DeployResult: &agentpb.DeployResult{
-					CommandId: cmdID,
-					Success:   false,
-					Error:     err.Error(),
+					CommandId:   cmdID,
+					Success:     true,
+					ContainerId: containerID,
 				},
 			},
-		})
-		return
-	}
-	_ = h.stream.Send(&agentpb.AgentMessage{
-		MessageId: uuid.New().String(),
-		Payload: &agentpb.AgentMessage_DeployResult{
-			DeployResult: &agentpb.DeployResult{
-				CommandId:   cmdID,
-				Success:     true,
-				ContainerId: containerID,
-			},
 		},
-	})
+	)
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
-func (h *CommandHandler) handleCollectMetrics(ctx context.Context, cmdID string) error {
+func (h *CommandHandler) handleCollectMetrics(_ context.Context, cmdID string) error {
 	m, err := CollectMetrics()
 	if err != nil {
 		return h.sendError(cmdID, "METRICS_FAILED", err.Error())
 	}
-	return h.stream.Send(&agentpb.AgentMessage{
-		MessageId: uuid.New().String(),
-		Payload: &agentpb.AgentMessage_Metrics{
-			Metrics: &agentpb.MetricsResult{
-				CommandId:   cmdID,
-				CpuPercent:  m.CPUPercent,
-				MemUsedMb:   m.MemUsedMB,
-				MemTotalMb:  m.MemTotalMB,
-				DiskUsedGb:  m.DiskUsedGB,
-				DiskTotalGb: m.DiskTotalGB,
-				NetRxMb:     m.NetRxMB,
-				NetTxMb:     m.NetTxMB,
+	return h.stream.Send(
+		&agentpb.AgentMessage{
+			MessageId: uuid.New().String(),
+			Payload: &agentpb.AgentMessage_Metrics{
+				Metrics: &agentpb.MetricsResult{
+					CommandId:   cmdID,
+					CpuPercent:  m.CPUPercent,
+					MemUsedMb:   m.MemUsedMB,
+					MemTotalMb:  m.MemTotalMB,
+					DiskUsedGb:  m.DiskUsedGB,
+					DiskTotalGb: m.DiskTotalGB,
+					NetRxMb:     m.NetRxMB,
+					NetTxMb:     m.NetTxMB,
+				},
 			},
 		},
-	})
+	)
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -227,27 +233,31 @@ func (h *CommandHandler) handleRemoveRoute(ctx context.Context, cmdID string, cm
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func (h *CommandHandler) sendAck(cmdID string, accepted bool, reason string) error {
-	return h.stream.Send(&agentpb.AgentMessage{
-		MessageId: uuid.New().String(),
-		Payload: &agentpb.AgentMessage_CommandAck{
-			CommandAck: &agentpb.CommandAck{
-				CommandId: cmdID,
-				Accepted:  accepted,
-				Reason:    reason,
+	return h.stream.Send(
+		&agentpb.AgentMessage{
+			MessageId: uuid.New().String(),
+			Payload: &agentpb.AgentMessage_CommandAck{
+				CommandAck: &agentpb.CommandAck{
+					CommandId: cmdID,
+					Accepted:  accepted,
+					Reason:    reason,
+				},
 			},
 		},
-	})
+	)
 }
 
 func (h *CommandHandler) sendError(cmdID, code, message string) error {
-	return h.stream.Send(&agentpb.AgentMessage{
-		MessageId: uuid.New().String(),
-		Payload: &agentpb.AgentMessage_Error{
-			Error: &agentpb.ErrorEvent{
-				CommandId: cmdID,
-				Code:      code,
-				Message:   message,
+	return h.stream.Send(
+		&agentpb.AgentMessage{
+			MessageId: uuid.New().String(),
+			Payload: &agentpb.AgentMessage_Error{
+				Error: &agentpb.ErrorEvent{
+					CommandId: cmdID,
+					Code:      code,
+					Message:   message,
+				},
 			},
 		},
-	})
+	)
 }

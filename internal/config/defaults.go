@@ -22,4 +22,5 @@ func setDefaults() {
 	viper.SetDefault("CADDY_ADMIN_URL", "http://127.0.0.1:2019")
 
 	viper.SetDefault("LOG_LEVEL", "info")
+	viper.SetDefault("AGENT_ENV_FILE", "/etc/tidefly-agent/.env")
 }

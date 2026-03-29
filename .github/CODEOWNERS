@@ -1,0 +1,17 @@
+# =============================================================================
+# Tidefly CODEOWNERS
+# Automatically assigns reviewers on pull requests.
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+# =============================================================================
+
+# Default — catches everything not matched below
+*                           @DBuettgen
+
+# ─── Components ──────────────────────────────────────────────────────────────
+/backend/                   @DBuettgen
+/frontend/                  @DBuettgen
+/tui/                       @DBuettgen
+/docs/                      @DBuettgen
+
+# ─── CI/CD & Security (extra attention) ──────────────────────────────────────
+/.github/                   @DBuettgen

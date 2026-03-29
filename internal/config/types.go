@@ -14,6 +14,7 @@ type AgentConfig struct {
 	ID      string // UUID — generated on first start, persisted
 	Name    string // human-readable hostname
 	Version string
+	EnvFile string
 }
 
 type PlaneConfig struct {

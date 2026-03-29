@@ -20,11 +20,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
-	// proto is copied from tidefly-backend (or use a shared module later)
 	agentpb "github.com/tidefly-oss/tidefly-agent/internal/proto"
 )
 
-// Agent manages the lifecycle: registration → connect → command loop.
 type Agent struct {
 	cfg     *config.Config
 	version string
@@ -39,11 +37,6 @@ func New(cfg *config.Config, version string) (*Agent, error) {
 	return &Agent{cfg: cfg, version: version, id: id}, nil
 }
 
-// Run is the main loop:
-// 1. Register with Plane if not already registered (get mTLS cert)
-// 2. Connect via gRPC mTLS
-// 3. Handle commands, send heartbeats
-// 4. On disconnect: retry with backoff
 func (a *Agent) Run(ctx context.Context) error {
 	if !a.cfg.IsRegistered() {
 		slog.Info("agent: not registered, starting registration")
@@ -53,10 +46,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		slog.Info("agent: registration complete")
 	}
 
-	// Start cert renewal loop (checks daily, renews if < 30 days left)
 	go a.startRenewalLoop(ctx)
 
-	// Connect loop with retry
 	for {
 		select {
 		case <-ctx.Done():
@@ -103,18 +94,18 @@ func (a *Agent) register(ctx context.Context) error {
 		return fmt.Errorf("PLANE_TOKEN is required for registration")
 	}
 
-	body, _ := json.Marshal(registerRequest{
-		Token:        a.cfg.Plane.Token,
-		WorkerID:     a.id,
-		Name:         a.cfg.Agent.Name,
-		AgentVersion: a.version,
-		OS:           runtime.GOOS,
-		Arch:         runtime.GOARCH,
-		RuntimeType:  a.cfg.Runtime.Type,
-	})
+	body, _ := json.Marshal(
+		registerRequest{
+			Token:        a.cfg.Plane.Token,
+			WorkerID:     a.id,
+			Name:         a.cfg.Agent.Name,
+			AgentVersion: a.version,
+			OS:           runtime.GOOS,
+			Arch:         runtime.GOARCH,
+			RuntimeType:  a.cfg.Runtime.Type,
+		},
+	)
 
-	// Registration goes over HTTPS (plain TLS, not mTLS — no client cert yet)
-	// Plane endpoint for HTTP is derived from gRPC endpoint
 	httpEndpoint := grpcToHTTP(a.cfg.Plane.Endpoint)
 	url := httpEndpoint + "/api/v1/agent/register"
 
@@ -128,9 +119,9 @@ func (a *Agent) register(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("registration request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusCreated {
+	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("registration failed (%d): %s", resp.StatusCode, string(b))
 	}
@@ -140,7 +131,6 @@ func (a *Agent) register(ctx context.Context) error {
 		return fmt.Errorf("decode registration response: %w", err)
 	}
 
-	// Persist certs to disk
 	if err := os.MkdirAll(a.cfg.CertDir(), 0700); err != nil {
 		return fmt.Errorf("create cert dir: %w", err)
 	}
@@ -154,12 +144,10 @@ func (a *Agent) register(ctx context.Context) error {
 		return err
 	}
 
-	// Persist worker ID
 	a.id = reg.WorkerID
 	slog.Info("agent: certs saved", "cert", a.cfg.Plane.CertFile, "expires_at", reg.ExpiresAt)
 
-	// Remove token from .env — it's one-time use only
-	clearRegistrationToken(".env")
+	patchEnvAfterRegistration(a.cfg.Agent.EnvFile, a.id)
 
 	return nil
 }
@@ -179,7 +167,7 @@ func (a *Agent) connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("grpc dial: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	client := agentpb.NewAgentServiceClient(conn)
 
@@ -190,29 +178,28 @@ func (a *Agent) connect(ctx context.Context) error {
 
 	slog.Info("agent: stream opened, sending hello")
 
-	// Send AgentHello
-	if err := stream.Send(&agentpb.AgentMessage{
-		MessageId: uuid.New().String(),
-		WorkerId:  a.id,
-		Payload: &agentpb.AgentMessage_Hello{
-			Hello: &agentpb.AgentHello{
-				AgentVersion: a.version,
-				Os:           runtime.GOOS,
-				Arch:         runtime.GOARCH,
-				RuntimeType:  a.cfg.Runtime.Type,
-				Hostname:     a.cfg.Agent.Name,
+	if err := stream.Send(
+		&agentpb.AgentMessage{
+			MessageId: uuid.New().String(),
+			WorkerId:  a.id,
+			Payload: &agentpb.AgentMessage_Hello{
+				Hello: &agentpb.AgentHello{
+					AgentVersion: a.version,
+					Os:           runtime.GOOS,
+					Arch:         runtime.GOARCH,
+					RuntimeType:  a.cfg.Runtime.Type,
+					Hostname:     a.cfg.Agent.Name,
+				},
 			},
 		},
-	}); err != nil {
+	); err != nil {
 		return fmt.Errorf("send hello: %w", err)
 	}
 
-	// Start heartbeat goroutine
 	heartbeatDone := make(chan struct{})
 	go a.heartbeatLoop(ctx, stream, heartbeatDone)
 	defer close(heartbeatDone)
 
-	// Receive loop
 	handler := NewCommandHandler(a.cfg, stream)
 	for {
 		msg, err := stream.Recv()
@@ -235,15 +222,20 @@ func (a *Agent) heartbeatLoop(ctx context.Context, stream agentpb.AgentService_C
 		case <-done:
 			return
 		case <-ticker.C:
-			_ = stream.Send(&agentpb.AgentMessage{
-				MessageId: uuid.New().String(),
-				WorkerId:  a.id,
-				Payload: &agentpb.AgentMessage_Heartbeat{
-					Heartbeat: &agentpb.AgentHeartbeat{
-						Timestamp: time.Now().UnixMilli(),
+			cpu, mem := collectQuickMetrics()
+			_ = stream.Send(
+				&agentpb.AgentMessage{
+					MessageId: uuid.New().String(),
+					WorkerId:  a.id,
+					Payload: &agentpb.AgentMessage_Heartbeat{
+						Heartbeat: &agentpb.AgentHeartbeat{
+							Timestamp:  time.Now().UnixMilli(),
+							CpuPercent: cpu,
+							MemPercent: mem,
+						},
 					},
 				},
-			})
+			)
 		}
 	}
 }
@@ -282,15 +274,10 @@ func (a *Agent) buildTLSConfig() (*tls.Config, error) {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-// grpcToHTTP converts "plane.example.com:7443" → "https://plane.example.com:8181"
-// The HTTP port is derived from the standard Tidefly backend port.
-// Users can override via PLANE_HTTP_ENDPOINT env var.
 func grpcToHTTP(grpcEndpoint string) string {
 	if v := os.Getenv("PLANE_HTTP_ENDPOINT"); v != "" {
 		return v
 	}
-	// Strip gRPC port, use HTTPS on standard port
-	// e.g. plane.example.com:7443 → https://plane.example.com
 	host := grpcEndpoint
 	for i := len(grpcEndpoint) - 1; i >= 0; i-- {
 		if grpcEndpoint[i] == ':' {

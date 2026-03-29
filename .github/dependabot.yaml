@@ -1,0 +1,48 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - go
+    groups:
+      grpc:
+        patterns:
+          - "google.golang.org/grpc*"
+          - "google.golang.org/protobuf*"
+      minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: "Europe/Berlin"
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: "Europe/Berlin"
+    labels:
+      - dependencies
+      - docker

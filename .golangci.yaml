@@ -1,0 +1,49 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - goconst
+    - gocritic
+    - gocyclo
+    - govet
+    - ineffassign
+    - misspell
+    - noctx
+    - staticcheck
+    - unused
+    - whitespace
+  settings:
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+    gocyclo:
+      min-complexity: 40
+    misspell:
+      locale: US
+  exclusions:
+    rules:
+      - path: "_test\\.go"
+        linters:
+          - goconst
+      - path: "cmd/.*\\.go"
+        linters:
+          - govet
+      - linters:
+          - errcheck
+        text: "Error return value of `fmt.Fprintf` is not checked"
+      - linters:
+          - errcheck
+        text: "Error return value of `huma.WriteErr` is not checked"
+      - path: ".*podman.*"
+        linters:
+          - bodyclose
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly

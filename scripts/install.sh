@@ -1,120 +1,101 @@
-#!/usr/bin/env bash
+#!/usr/bin/env sh
 # =============================================================================
 # Tidefly Agent Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/tidefly-oss/tidefly-agent/main/scripts/install.sh | sh
-# Or with token: PLANE_ENDPOINT=plane.example.com:7443 PLANE_TOKEN=tfy_reg_xxx ... | sh
+# Supports: Docker, Podman (rootful + rootless)
 # =============================================================================
-set -euo pipefail
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/tidefly-oss/tidefly-agent/main/scripts/install.sh \
+#     | PLANE_TOKEN=tfy_reg_xxx PLANE_ENDPOINT=plane.example.com:7443 sh
+# =============================================================================
+set -eu
 
-# ── Config ────────────────────────────────────────────────────────────────────
-REPO="tidefly-oss/tidefly-agent"
-BINARY="tidefly-agent"
-INSTALL_DIR="/usr/local/bin"
+IMAGE="ghcr.io/tidefly-oss/tidefly-agent"
+TAG="${TIDEFLY_VERSION:-latest}"
+CONTAINER_NAME="tidefly-agent"
 CONFIG_DIR="/etc/tidefly-agent"
-SERVICE_FILE="/etc/systemd/system/tidefly-agent.service"
 ENV_FILE="$CONFIG_DIR/.env"
+COMPOSE_FILE="$CONFIG_DIR/docker-compose.yml"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-info()    { echo -e "${BLUE}[tidefly]${NC} $*"; }
-success() { echo -e "${GREEN}[tidefly]${NC} $*"; }
-warn()    { echo -e "${YELLOW}[tidefly]${NC} $*"; }
-error()   { echo -e "${RED}[tidefly]${NC} $*" >&2; exit 1; }
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+info()    { printf "${BLUE}[tidefly]${NC} %s\n" "$*"; }
+success() { printf "${GREEN}[tidefly]${NC} %s\n" "$*"; }
+warn()    { printf "${YELLOW}[tidefly]${NC} %s\n" "$*"; }
+error()   { printf "${RED}[tidefly]${NC} %s\n" "$*" >&2; exit 1; }
 
 # ── Root check ────────────────────────────────────────────────────────────────
-if [ "$(id -u)" -ne 0 ]; then
-  error "This installer must be run as root. Try: sudo sh"
+[ "$(id -u)" -eq 0 ] || error "Run as root: sudo sh"
+
+# ── Detect container runtime ──────────────────────────────────────────────────
+if command -v docker > /dev/null 2>&1 && docker info > /dev/null 2>&1; then
+  RUNTIME="docker"
+  SOCKET="/var/run/docker.sock"
+elif command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
+  RUNTIME="podman"
+  SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+  # rootful podman
+  if [ "$(id -u)" -eq 0 ]; then
+    SOCKET="/run/podman/podman.sock"
+  fi
+else
+  error "Docker or Podman is required. Install one first:
+  Docker: https://docs.docker.com/engine/install/
+  Podman: https://podman.io/getting-started/installation"
 fi
 
-# ── Detect OS / Arch ──────────────────────────────────────────────────────────
-OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64)  ARCH="amd64" ;;
-  aarch64) ARCH="arm64" ;;
-  armv7l)  ARCH="arm"   ;;
-  *)       error "Unsupported architecture: $ARCH" ;;
-esac
+info "Using runtime: $RUNTIME"
 
-if [ "$OS" != "linux" ]; then
-  error "Only Linux is supported. Got: $OS"
-fi
-
-# ── Detect latest version ─────────────────────────────────────────────────────
-info "Fetching latest release..."
-VERSION="${TIDEFLY_AGENT_VERSION:-}"
-if [ -z "$VERSION" ]; then
-  VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-    | grep '"tag_name"' | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
-fi
-
-if [ -z "$VERSION" ]; then
-  error "Could not determine latest version. Set TIDEFLY_AGENT_VERSION manually."
-fi
-
-info "Installing tidefly-agent $VERSION ($OS/$ARCH)"
-
-# ── Download binary ───────────────────────────────────────────────────────────
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
-
-DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/tidefly-agent_${OS}_${ARCH}.tar.gz"
-info "Downloading from $DOWNLOAD_URL"
-
-curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/tidefly-agent.tar.gz" \
-  || error "Download failed. Check the URL or your internet connection."
-
-tar -xzf "$TMP_DIR/tidefly-agent.tar.gz" -C "$TMP_DIR"
-chmod +x "$TMP_DIR/$BINARY"
-mv "$TMP_DIR/$BINARY" "$INSTALL_DIR/$BINARY"
-
-success "Binary installed to $INSTALL_DIR/$BINARY"
+# ── Validate required inputs ──────────────────────────────────────────────────
+[ -n "${PLANE_ENDPOINT:-}" ] || error "PLANE_ENDPOINT is required (e.g. plane.example.com:7443)"
+[ -n "${PLANE_TOKEN:-}" ]    || error "PLANE_TOKEN is required — generate one in Tidefly UI → Servers → Add Server"
 
 # ── Create config dir ─────────────────────────────────────────────────────────
 mkdir -p "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"
 
-# ── Write .env if not exists ──────────────────────────────────────────────────
-if [ ! -f "$ENV_FILE" ]; then
-  # Generate a stable agent ID
-  AGENT_ID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
+# ── Generate .env ─────────────────────────────────────────────────────────────
+if [ -f "$ENV_FILE" ]; then
+  warn "Config already exists at $ENV_FILE — skipping generation"
+else
+  # Generate agent ID
+  AGENT_ID=""
+  if [ -f /proc/sys/kernel/random/uuid ]; then
+    AGENT_ID="$(cat /proc/sys/kernel/random/uuid)"
+  elif command -v uuidgen > /dev/null 2>&1; then
+    AGENT_ID="$(uuidgen)"
+  else
+    # Fallback: generate from /dev/urandom
+    AGENT_ID="$(od -An -tx1 /dev/urandom | head -4 | tr -d ' \n' | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\).*/\1-\2-\3-\4-\5/')"
+  fi
+
   AGENT_NAME="${AGENT_NAME:-$(hostname)}"
+  RUNTIME_SOCKET="$SOCKET"
 
   cat > "$ENV_FILE" << EOF
 # Tidefly Agent Configuration
 # Generated by installer on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 # ── Agent Identity ─────────────────────────────────────────────
-AGENT_ID=$AGENT_ID
-AGENT_NAME=$AGENT_NAME
+AGENT_ID=${AGENT_ID}
+AGENT_NAME=${AGENT_NAME}
+AGENT_VERSION=${TAG}
+AGENT_ENV_FILE=${ENV_FILE}
 
 # ── Plane Connection ───────────────────────────────────────────
-# gRPC endpoint of your Tidefly Plane (host:port)
-PLANE_ENDPOINT=${PLANE_ENDPOINT:-}
-
-# One-time registration token (generate in Tidefly UI → Servers → Add Server)
-# Remove this line after first successful registration
-PLANE_TOKEN=${PLANE_TOKEN:-}
-
-# HTTP endpoint of your Tidefly Plane (for registration request)
-# Leave empty to auto-derive from PLANE_ENDPOINT
+PLANE_ENDPOINT=${PLANE_ENDPOINT}
+PLANE_TOKEN=${PLANE_TOKEN}
 PLANE_HTTP_ENDPOINT=${PLANE_HTTP_ENDPOINT:-}
 
 # ── Certificate Paths ──────────────────────────────────────────
-PLANE_CERT_FILE=$CONFIG_DIR/client.crt
-PLANE_KEY_FILE=$CONFIG_DIR/client.key
-PLANE_CA_FILE=$CONFIG_DIR/ca.crt
+PLANE_CERT_FILE=${CONFIG_DIR}/client.crt
+PLANE_KEY_FILE=${CONFIG_DIR}/client.key
+PLANE_CA_FILE=${CONFIG_DIR}/ca.crt
 
 # ── Runtime ────────────────────────────────────────────────────
-RUNTIME_TYPE=docker
-RUNTIME_SOCKET=/var/run/docker.sock
+RUNTIME_TYPE=${RUNTIME}
+RUNTIME_SOCKET=${RUNTIME_SOCKET}
 
-# ── Caddy (local reverse proxy on this worker) ─────────────────
+# ── Caddy ──────────────────────────────────────────────────────
 CADDY_ENABLED=true
 CADDY_ADMIN_URL=http://127.0.0.1:2019
 
@@ -123,63 +104,92 @@ LOG_LEVEL=info
 EOF
   chmod 600 "$ENV_FILE"
   success "Config written to $ENV_FILE"
+fi
+
+# ── Write docker-compose.yml ──────────────────────────────────────────────────
+cat > "$COMPOSE_FILE" << EOF
+services:
+  tidefly-agent:
+    image: ${IMAGE}:${TAG}
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    env_file:
+      - ${ENV_FILE}
+    volumes:
+      - ${SOCKET}:/var/run/docker.sock
+      - ${CONFIG_DIR}:${CONFIG_DIR}
+    network_mode: host
+EOF
+success "Compose file written to $COMPOSE_FILE"
+
+# ── Pull image ────────────────────────────────────────────────────────────────
+info "Pulling ${IMAGE}:${TAG}..."
+$RUNTIME pull "${IMAGE}:${TAG}" || error "Failed to pull image. Check your internet connection."
+
+# ── Stop existing container if running ───────────────────────────────────────
+if $RUNTIME inspect "$CONTAINER_NAME" > /dev/null 2>&1; then
+  info "Stopping existing $CONTAINER_NAME..."
+  $RUNTIME rm -f "$CONTAINER_NAME" > /dev/null
+fi
+
+# ── Start container ───────────────────────────────────────────────────────────
+info "Starting tidefly-agent..."
+
+if command -v docker > /dev/null 2>&1 && [ "$RUNTIME" = "docker" ] && command -v docker-compose > /dev/null 2>&1; then
+  docker-compose -f "$COMPOSE_FILE" up -d
+elif command -v docker > /dev/null 2>&1 && [ "$RUNTIME" = "docker" ]; then
+  docker compose -f "$COMPOSE_FILE" up -d 2>/dev/null || \
+  $RUNTIME run -d \
+    --name "$CONTAINER_NAME" \
+    --restart unless-stopped \
+    --env-file "$ENV_FILE" \
+    -v "${SOCKET}:/var/run/docker.sock" \
+    -v "${CONFIG_DIR}:${CONFIG_DIR}" \
+    --network host \
+    "${IMAGE}:${TAG}"
 else
-  warn "Config already exists at $ENV_FILE — skipping"
+  # Podman — use podman run directly
+  $RUNTIME run -d \
+    --name "$CONTAINER_NAME" \
+    --restart unless-stopped \
+    --env-file "$ENV_FILE" \
+    -v "${SOCKET}:/var/run/docker.sock" \
+    -v "${CONFIG_DIR}:${CONFIG_DIR}" \
+    --network host \
+    "${IMAGE}:${TAG}"
 fi
 
-# ── Validate required config ──────────────────────────────────────────────────
-# shellcheck disable=SC1090
-. "$ENV_FILE"
-
-if [ -z "${PLANE_ENDPOINT:-}" ]; then
-  warn ""
-  warn "PLANE_ENDPOINT is not set in $ENV_FILE"
-  warn "Edit the config before starting the agent:"
-  warn "  $ENV_FILE"
-fi
-
-# ── Install systemd service ───────────────────────────────────────────────────
+# ── Install systemd service (optional, for auto-start on boot) ────────────────
 if command -v systemctl > /dev/null 2>&1; then
-  cat > "$SERVICE_FILE" << EOF
+  cat > /etc/systemd/system/tidefly-agent.service << EOF
 [Unit]
 Description=Tidefly Agent
-Documentation=https://github.com/tidefly-oss/tidefly-agent
-After=network-online.target docker.service
+After=network-online.target ${RUNTIME}.service
 Wants=network-online.target
 
 [Service]
-Type=simple
-User=root
-WorkingDirectory=$CONFIG_DIR
-EnvironmentFile=$ENV_FILE
-ExecStart=$INSTALL_DIR/$BINARY
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=tidefly-agent
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${RUNTIME} start ${CONTAINER_NAME}
+ExecStop=${RUNTIME} stop ${CONTAINER_NAME}
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
-  systemctl enable tidefly-agent
-
-  success "Systemd service installed and enabled"
-  info ""
-  info "Next steps:"
-  info "  1. Edit config:  nano $ENV_FILE"
-  info "  2. Set PLANE_ENDPOINT and PLANE_TOKEN"
-  info "  3. Start agent:  systemctl start tidefly-agent"
-  info "  4. Check status: systemctl status tidefly-agent"
-  info "  5. View logs:    journalctl -u tidefly-agent -f"
-else
-  warn "systemd not found — skipping service installation"
-  info ""
-  info "Start manually:"
-  info "  $INSTALL_DIR/$BINARY"
+  systemctl enable tidefly-agent > /dev/null 2>&1
+  success "Systemd service installed — agent will start on boot"
 fi
 
+# ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
-success "tidefly-agent $VERSION installed successfully!"
+success "tidefly-agent ${TAG} installed and running!"
+echo ""
+info "Useful commands:"
+info "  Logs:    ${RUNTIME} logs -f ${CONTAINER_NAME}"
+info "  Status:  ${RUNTIME} inspect ${CONTAINER_NAME}"
+info "  Stop:    ${RUNTIME} stop ${CONTAINER_NAME}"
+info "  Config:  ${ENV_FILE}"
+echo ""
+info "The agent will register with your Plane automatically."
+info "Once registered, it will appear in the Tidefly UI → Servers."

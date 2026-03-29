@@ -1,17 +1,28 @@
 version: "3"
 
+vars:
+  VERSION:
+    sh: git describe --tags --always --dirty 2>/dev/null || echo "dev"
+  IMAGE: ghcr.io/tidefly-oss/tidefly-agent
+
 tasks:
   default:
     cmds:
       - task: build
 
+  # ── Go ────────────────────────────────────────────────────────────────────
+
   build:
-    desc: Build the agent binary
+    desc: Build the agent binary (current platform)
     cmds:
-      - go build -ldflags "-X main.version={{.VERSION}}" -o bin/tidefly-agent ./cmd/tidefly-agent
-    vars:
-      VERSION:
-        sh: git describe --tags --always --dirty 2>/dev/null || echo "dev"
+      - go build -ldflags "-X main.version={{.VERSION}} -s -w" -o bin/tidefly-agent ./cmd/tidefly-agent
+
+  build-all:
+    desc: Cross-compile for all supported platforms
+    cmds:
+      - CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-X main.version={{.VERSION}} -s -w" -o bin/tidefly-agent_linux_amd64 ./cmd/tidefly-agent
+      - CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "-X main.version={{.VERSION}} -s -w" -o bin/tidefly-agent_linux_arm64 ./cmd/tidefly-agent
+      - CGO_ENABLED=0 GOOS=linux GOARCH=arm   go build -ldflags "-X main.version={{.VERSION}} -s -w" -o bin/tidefly-agent_linux_arm   ./cmd/tidefly-agent
 
   run:
     desc: Run the agent locally (requires .env in project root)
@@ -31,8 +42,9 @@ tasks:
       - go test ./...
 
   lint:
-    desc: Run linter
+    desc: Run linter (installs golangci-lint if missing)
     cmds:
+      - which golangci-lint || go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
       - golangci-lint run ./...
 
   tidy:
@@ -40,17 +52,38 @@ tasks:
     cmds:
       - go mod tidy
 
-  build-all:
-    desc: Cross-compile for all supported platforms
-    cmds:
-      - GOOS=linux GOARCH=amd64  go build -ldflags "-X main.version={{.VERSION}}" -o bin/tidefly-agent_linux_amd64  ./cmd/tidefly-agent
-      - GOOS=linux GOARCH=arm64  go build -ldflags "-X main.version={{.VERSION}}" -o bin/tidefly-agent_linux_arm64  ./cmd/tidefly-agent
-      - GOOS=linux GOARCH=arm    go build -ldflags "-X main.version={{.VERSION}}" -o bin/tidefly-agent_linux_arm    ./cmd/tidefly-agent
-    vars:
-      VERSION:
-        sh: git describe --tags --always --dirty 2>/dev/null || echo "dev"
-
   clean:
     desc: Remove build artifacts
     cmds:
       - rm -rf bin/
+
+  # ── Docker ────────────────────────────────────────────────────────────────
+
+  docker-build:
+    desc: Build multi-arch Docker image locally (requires buildx)
+    cmds:
+      - docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 --build-arg VERSION={{.VERSION}} --file docker/Dockerfile --tag {{.IMAGE}}:{{.VERSION}} --tag {{.IMAGE}}:latest .
+
+  docker-push:
+    desc: Build and push multi-arch image to GHCR
+    cmds:
+      - docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 --build-arg VERSION={{.VERSION}} --file docker/Dockerfile --tag {{.IMAGE}}:{{.VERSION}} --tag {{.IMAGE}}:latest --push .
+
+  docker-load:
+    desc: Build image for current platform and load into Docker (for local testing)
+    cmds:
+      - docker buildx build --build-arg VERSION={{.VERSION}} --file docker/Dockerfile --tag {{.IMAGE}}:{{.VERSION}} --tag {{.IMAGE}}:latest --load .
+
+  docker-run:
+    desc: Run agent locally via Docker (requires /etc/tidefly-agent/.env)
+    cmds:
+      - docker run --rm --name tidefly-agent-dev --env-file /etc/tidefly-agent/.env -v /var/run/docker.sock:/var/run/docker.sock -v /etc/tidefly-agent:/etc/tidefly-agent --network host {{.IMAGE}}:{{.VERSION}}
+
+  # ── Release ───────────────────────────────────────────────────────────────
+
+  release:
+    desc: "Tag and push a release. Usage: task release TAG=v0.1.0-alpha"
+    cmds:
+      - git tag {{.TAG}}
+      - git push origin {{.TAG}}
+      - echo "Tag {{.TAG}} pushed — GitHub Actions will build and publish the image"

@@ -13,7 +13,7 @@ import (
 func Load() (*Config, error) {
 	viper.SetConfigFile(".env")
 	viper.SetConfigType("env")
-	_ = viper.ReadInConfig() // optional — env vars take precedence
+	_ = viper.ReadInConfig()
 
 	viper.AutomaticEnv()
 	setDefaults()
@@ -45,6 +45,7 @@ func parse() *Config {
 			ID:      viper.GetString("AGENT_ID"),
 			Name:    name,
 			Version: viper.GetString("AGENT_VERSION"),
+			EnvFile: viper.GetString("AGENT_ENV_FILE"),
 		},
 		Plane: PlaneConfig{
 			Endpoint:    viper.GetString("PLANE_ENDPOINT"),
@@ -112,6 +113,8 @@ func (c *Config) CertDir() string {
 }
 
 func (c *Config) String() string {
-	return fmt.Sprintf("agent=%s endpoint=%s runtime=%s",
-		c.Agent.Name, c.Plane.Endpoint, c.Runtime.Type)
+	return fmt.Sprintf(
+		"agent=%s endpoint=%s runtime=%s",
+		c.Agent.Name, c.Plane.Endpoint, c.Runtime.Type,
+	)
 }

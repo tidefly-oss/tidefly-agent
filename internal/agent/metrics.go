@@ -9,6 +9,7 @@ import (
 	"github.com/shirou/gopsutil/v4/net"
 )
 
+// Metrics ist die interne Repräsentation — handler.go mapped das auf agentpb.MetricsResult.
 type Metrics struct {
 	CPUPercent  float64
 	MemUsedMB   float64
@@ -58,4 +59,15 @@ func CollectMetrics() (*Metrics, error) {
 		NetRxMB:     float64(rxBytes) / 1024 / 1024,
 		NetTxMB:     float64(txBytes) / 1024 / 1024,
 	}, nil
+}
+
+// collectQuickMetrics wird im Heartbeat genutzt — nur CPU+RAM, kein disk/net IO.
+func collectQuickMetrics() (cpuPercent, memPercent float64) {
+	if pcts, err := cpu.Percent(0, false); err == nil && len(pcts) > 0 {
+		cpuPercent = pcts[0]
+	}
+	if v, err := mem.VirtualMemory(); err == nil {
+		memPercent = v.UsedPercent
+	}
+	return
 }

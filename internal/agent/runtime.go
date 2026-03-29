@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
@@ -47,23 +46,27 @@ func (r *RuntimeClient) ListContainers(ctx context.Context) ([]*agentpb.Containe
 		}
 		ports := make([]*agentpb.PortBinding, 0, len(c.Ports))
 		for _, p := range c.Ports {
-			ports = append(ports, &agentpb.PortBinding{
-				HostIp:        p.IP,
-				HostPort:      int32(p.PublicPort),
-				ContainerPort: int32(p.PrivatePort),
-				Protocol:      p.Type,
-			})
+			ports = append(
+				ports, &agentpb.PortBinding{
+					HostIp:        p.IP,
+					HostPort:      int32(p.PublicPort),
+					ContainerPort: int32(p.PrivatePort),
+					Protocol:      p.Type,
+				},
+			)
 		}
-		result = append(result, &agentpb.Container{
-			Id:      c.ID[:12],
-			Name:    name,
-			Image:   c.Image,
-			Status:  c.Status,
-			State:   c.State,
-			Created: c.Created * 1000,
-			Labels:  c.Labels,
-			Ports:   ports,
-		})
+		result = append(
+			result, &agentpb.Container{
+				Id:      c.ID[:12],
+				Name:    name,
+				Image:   c.Image,
+				Status:  c.Status,
+				State:   c.State,
+				Created: c.Created * 1000,
+				Labels:  c.Labels,
+				Ports:   ports,
+			},
+		)
 	}
 	return result, nil
 }
@@ -81,32 +84,38 @@ func (r *RuntimeClient) StopContainer(ctx context.Context, containerID string, t
 }
 
 func (r *RuntimeClient) RestartContainer(ctx context.Context, containerID string) error {
-	t := 10
-	return r.docker.ContainerRestart(ctx, containerID, container.StopOptions{Timeout: &t})
+	return r.docker.ContainerRestart(ctx, containerID, container.StopOptions{Timeout: new(10)})
 }
 
 func (r *RuntimeClient) RemoveContainer(ctx context.Context, containerID string, force bool) error {
 	return r.docker.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: force})
 }
 
-func (r *RuntimeClient) StreamLogs(ctx context.Context, containerID string, follow bool, tailLines int32) (<-chan LogLine, error) {
+func (r *RuntimeClient) StreamLogs(
+	ctx context.Context,
+	containerID string,
+	follow bool,
+	tailLines int32,
+) (<-chan LogLine, error) {
 	tail := "50"
 	if tailLines > 0 {
 		tail = fmt.Sprintf("%d", tailLines)
 	}
-	reader, err := r.docker.ContainerLogs(ctx, containerID, container.LogsOptions{
-		ShowStdout: true,
-		ShowStderr: true,
-		Follow:     follow,
-		Tail:       tail,
-	})
+	reader, err := r.docker.ContainerLogs(
+		ctx, containerID, container.LogsOptions{
+			ShowStdout: true,
+			ShowStderr: true,
+			Follow:     follow,
+			Tail:       tail,
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
 	ch := make(chan LogLine, 100)
 	go func() {
 		defer close(ch)
-		defer reader.Close()
+		defer func() { _ = reader.Close() }()
 		buf := make([]byte, 8192)
 		for {
 			header := make([]byte, 8)
@@ -137,8 +146,10 @@ func (r *RuntimeClient) Deploy(ctx context.Context, cmd *agentpb.CmdDeploy) (str
 	if err != nil {
 		return "", fmt.Errorf("pull image %s: %w", cmd.Image, err)
 	}
-	defer out.Close()
-	io.Copy(io.Discard, out)
+	defer func() { _ = out.Close() }()
+	if _, err := io.Copy(io.Discard, out); err != nil {
+		return "", fmt.Errorf("drain pull output: %w", err)
+	}
 
 	portBindings := nat.PortMap{}
 	exposedPorts := nat.PortSet{}
@@ -168,7 +179,8 @@ func (r *RuntimeClient) Deploy(ctx context.Context, cmd *agentpb.CmdDeploy) (str
 	containerName := fmt.Sprintf("tidefly_%s_%s", cmd.ProjectId, cmd.ServiceName)
 	_ = r.docker.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true})
 
-	resp, err := r.docker.ContainerCreate(ctx,
+	resp, err := r.docker.ContainerCreate(
+		ctx,
 		&container.Config{
 			Image:        cmd.Image,
 			Env:          cmd.Env,
@@ -190,5 +202,3 @@ func (r *RuntimeClient) Deploy(ctx context.Context, cmd *agentpb.CmdDeploy) (str
 	}
 	return resp.ID[:12], nil
 }
-
-var _ = filters.Args{}

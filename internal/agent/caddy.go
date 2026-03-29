@@ -8,7 +8,6 @@ import (
 	"net/http"
 )
 
-// CaddyClient talks to the local Caddy Admin API on the worker.
 type CaddyClient struct {
 	adminURL string
 	http     *http.Client
@@ -39,7 +38,7 @@ func (c *CaddyClient) RegisterRoute(ctx context.Context, upstream, domain string
 	if err != nil {
 		return fmt.Errorf("caddy register route: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("caddy register route: status %d", resp.StatusCode)
@@ -57,11 +56,11 @@ func (c *CaddyClient) RemoveRoute(ctx context.Context, domain string) error {
 	if err != nil {
 		return fmt.Errorf("caddy remove route: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	return nil
 }
 
-func buildRoute(upstream, domain string, useTLS bool) map[string]any {
+func buildRoute(upstream, domain string, _ bool) map[string]any {
 	return map[string]any{
 		"@id": domain,
 		"match": []map[string]any{
