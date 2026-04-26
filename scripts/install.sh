@@ -9,7 +9,7 @@
 # =============================================================================
 set -eu
 
-IMAGE="ghcr.io/tidefly-oss/tidefly-agent"
+IMAGE="tidefly/tidefly-agent"
 TAG="${TIDEFLY_VERSION:-latest}"
 CONTAINER_NAME="tidefly-agent"
 CONFIG_DIR="/etc/tidefly-agent"
@@ -33,7 +33,6 @@ if command -v docker > /dev/null 2>&1 && docker info > /dev/null 2>&1; then
 elif command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
   RUNTIME="podman"
   SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
-  # rootful podman
   if [ "$(id -u)" -eq 0 ]; then
     SOCKET="/run/podman/podman.sock"
   fi
@@ -57,14 +56,12 @@ chmod 700 "$CONFIG_DIR"
 if [ -f "$ENV_FILE" ]; then
   warn "Config already exists at $ENV_FILE — skipping generation"
 else
-  # Generate agent ID
   AGENT_ID=""
   if [ -f /proc/sys/kernel/random/uuid ]; then
     AGENT_ID="$(cat /proc/sys/kernel/random/uuid)"
   elif command -v uuidgen > /dev/null 2>&1; then
     AGENT_ID="$(uuidgen)"
   else
-    # Fallback: generate from /dev/urandom
     AGENT_ID="$(od -An -tx1 /dev/urandom | head -4 | tr -d ' \n' | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\).*/\1-\2-\3-\4-\5/')"
   fi
 
@@ -148,7 +145,6 @@ elif command -v docker > /dev/null 2>&1 && [ "$RUNTIME" = "docker" ]; then
     --network host \
     "${IMAGE}:${TAG}"
 else
-  # Podman — use podman run directly
   $RUNTIME run -d \
     --name "$CONTAINER_NAME" \
     --restart unless-stopped \
@@ -159,7 +155,7 @@ else
     "${IMAGE}:${TAG}"
 fi
 
-# ── Install systemd service (optional, for auto-start on boot) ────────────────
+# ── Install systemd service ───────────────────────────────────────────────────
 if command -v systemctl > /dev/null 2>&1; then
   cat > /etc/systemd/system/tidefly-agent.service << EOF
 [Unit]
