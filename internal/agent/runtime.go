@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
@@ -46,29 +47,63 @@ func (r *RuntimeClient) ListContainers(ctx context.Context) ([]*agentpb.Containe
 		}
 		ports := make([]*agentpb.PortBinding, 0, len(c.Ports))
 		for _, p := range c.Ports {
-			ports = append(
-				ports, &agentpb.PortBinding{
-					HostIp:        p.IP,
-					HostPort:      int32(p.PublicPort),
-					ContainerPort: int32(p.PrivatePort),
-					Protocol:      p.Type,
-				},
-			)
+			ports = append(ports, &agentpb.PortBinding{
+				HostIp:        p.IP,
+				HostPort:      int32(p.PublicPort),
+				ContainerPort: int32(p.PrivatePort),
+				Protocol:      p.Type,
+			})
 		}
-		result = append(
-			result, &agentpb.Container{
-				Id:      c.ID[:12],
-				Name:    name,
-				Image:   c.Image,
-				Status:  c.Status,
-				State:   c.State,
-				Created: c.Created * 1000,
-				Labels:  c.Labels,
-				Ports:   ports,
-			},
-		)
+		result = append(result, &agentpb.Container{
+			Id:      c.ID[:12],
+			Name:    name,
+			Image:   c.Image,
+			Status:  c.Status,
+			State:   c.State,
+			Created: c.Created * 1000,
+			Labels:  c.Labels,
+			Ports:   ports,
+		})
 	}
 	return result, nil
+}
+
+// ListServiceContainers returns all containers belonging to a service
+// identified by the tidefly.service_name label.
+func (r *RuntimeClient) ListServiceContainers(ctx context.Context, serviceName string) ([]*agentpb.Container, error) {
+	all, err := r.ListContainers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var result []*agentpb.Container
+	for _, ct := range all {
+		if ct.Labels["tidefly.service_name"] == serviceName {
+			result = append(result, ct)
+		}
+	}
+	return result, nil
+}
+
+// RemoveServiceContainers stops and removes all containers for a service.
+func (r *RuntimeClient) RemoveServiceContainers(ctx context.Context, serviceName string) error {
+	f := filters.NewArgs(filters.Arg("label", "tidefly.service_name="+serviceName))
+	list, err := r.docker.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
+	if err != nil {
+		return err
+	}
+	for _, ct := range list {
+		t := 10
+		_ = r.docker.ContainerStop(ctx, ct.ID, container.StopOptions{Timeout: &t})
+		_ = r.docker.ContainerRemove(ctx, ct.ID, container.RemoveOptions{Force: true})
+	}
+	return nil
+}
+
+// RemoveNamedContainer stops and removes a single container by name.
+func (r *RuntimeClient) RemoveNamedContainer(ctx context.Context, name string) error {
+	t := 10
+	_ = r.docker.ContainerStop(ctx, name, container.StopOptions{Timeout: &t})
+	return r.docker.ContainerRemove(ctx, name, container.RemoveOptions{Force: true})
 }
 
 func (r *RuntimeClient) StartContainer(ctx context.Context, containerID string) error {
@@ -101,14 +136,12 @@ func (r *RuntimeClient) StreamLogs(
 	if tailLines > 0 {
 		tail = fmt.Sprintf("%d", tailLines)
 	}
-	reader, err := r.docker.ContainerLogs(
-		ctx, containerID, container.LogsOptions{
-			ShowStdout: true,
-			ShowStderr: true,
-			Follow:     follow,
-			Tail:       tail,
-		},
-	)
+	reader, err := r.docker.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     follow,
+		Tail:       tail,
+	})
 	if err != nil {
 		return nil, err
 	}

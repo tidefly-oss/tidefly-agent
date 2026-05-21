@@ -1,6 +1,6 @@
 services:
   tidefly-agent:
-    image: ghcr.io/tidefly-oss/tidefly-agent:latest
+    image: tidefly/tidefly-agent:latest
     container_name: tidefly-agent
     restart: unless-stopped
     env_file:
