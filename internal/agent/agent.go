@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -223,15 +224,17 @@ func (a *Agent) heartbeatLoop(ctx context.Context, stream agentpb.AgentService_C
 			return
 		case <-ticker.C:
 			cpu, mem := collectQuickMetrics()
+			containerCount := a.countContainers(ctx)
 			_ = stream.Send(
 				&agentpb.AgentMessage{
 					MessageId: uuid.New().String(),
 					WorkerId:  a.id,
 					Payload: &agentpb.AgentMessage_Heartbeat{
 						Heartbeat: &agentpb.AgentHeartbeat{
-							Timestamp:  time.Now().UnixMilli(),
-							CpuPercent: cpu,
-							MemPercent: mem,
+							Timestamp:      time.Now().UnixMilli(),
+							CpuPercent:     cpu,
+							MemPercent:     mem,
+							ContainerCount: int32(containerCount),
 						},
 					},
 				},
@@ -247,12 +250,10 @@ func (a *Agent) buildTLSConfig() (*tls.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load client cert: %w", err)
 	}
-
 	caPEM, err := os.ReadFile(a.cfg.Plane.CAFile)
 	if err != nil {
 		return nil, fmt.Errorf("read CA cert: %w", err)
 	}
-
 	block, _ := pem.Decode(caPEM)
 	if block == nil {
 		return nil, fmt.Errorf("decode CA PEM")
@@ -261,13 +262,18 @@ func (a *Agent) buildTLSConfig() (*tls.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse CA cert: %w", err)
 	}
-
 	pool := x509.NewCertPool()
 	pool.AddCert(caCert)
+
+	host := a.cfg.Plane.Endpoint
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
 
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      pool,
+		ServerName:   host,
 		MinVersion:   tls.VersionTLS13,
 	}, nil
 }
@@ -286,4 +292,19 @@ func grpcToHTTP(grpcEndpoint string) string {
 		}
 	}
 	return "https://" + host
+}
+
+func (a *Agent) countContainers(ctx context.Context) int {
+	rt := NewRuntimeClient(a.cfg.Runtime.Type, a.cfg.Runtime.SocketPath)
+	containers, err := rt.ListContainers(ctx)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, c := range containers {
+		if c.Labels["tidefly.internal"] != "true" && c.State == "running" {
+			count++
+		}
+	}
+	return count
 }
