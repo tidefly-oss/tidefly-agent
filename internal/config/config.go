@@ -93,9 +93,10 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// IsRegistered returns true if the agent already has a client certificate.
+// IsRegistered returns true if the agent already has a full cert bundle
+// (client cert, key, and CA) on disk.
 func (c *Config) IsRegistered() bool {
-	return fileExists(c.Plane.CertFile) && fileExists(c.Plane.KeyFile)
+	return fileExists(c.Plane.CertFile) && fileExists(c.Plane.KeyFile) && fileExists(c.Plane.CAFile)
 }
 
 func fileExists(path string) bool {

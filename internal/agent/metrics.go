@@ -71,3 +71,17 @@ func collectQuickMetrics() (cpuPercent, memPercent float64) {
 	}
 	return
 }
+
+// capacity reports absolute hardware capacity — sent once in AgentHello so
+// the plane's scheduler can compute free headroom in cores/MB instead of
+// just percentages (which aren't comparable across workers with different
+// hardware).
+func capacity() (cpuCores int32, memTotalMB int64) {
+	if counted, err := cpu.Counts(true); err == nil {
+		cpuCores = int32(counted)
+	}
+	if v, err := mem.VirtualMemory(); err == nil {
+		memTotalMB = int64(v.Total / 1024 / 1024)
+	}
+	return
+}

@@ -9,6 +9,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
+	dockernetwork "github.com/docker/docker/api/types/network"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 	agentpb "github.com/tidefly-oss/tidefly-agent/internal/proto"
@@ -32,6 +33,21 @@ func NewRuntimeClient(runtimeType, socketPath string) *RuntimeClient {
 	}
 	c, _ := dockerclient.NewClientWithOpts(opts...)
 	return &RuntimeClient{docker: c}
+}
+
+// ensureNetwork creates a bridge network on the worker if it doesn't
+// already exist. Worker hosts don't share the plane's local Docker
+// networks (they're separate machines), so a deploy referencing a network
+// name that hasn't been created there yet must provision it on demand
+// rather than fail.
+func (r *RuntimeClient) ensureNetwork(ctx context.Context, name string) error {
+	if _, err := r.docker.NetworkCreate(ctx, name, dockernetwork.CreateOptions{Driver: "bridge"}); err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (r *RuntimeClient) ListContainers(ctx context.Context) ([]*agentpb.Container, error) {
@@ -92,8 +108,7 @@ func (r *RuntimeClient) RemoveServiceContainers(ctx context.Context, serviceName
 		return err
 	}
 	for _, ct := range list {
-		t := 10
-		_ = r.docker.ContainerStop(ctx, ct.ID, container.StopOptions{Timeout: &t})
+		_ = r.docker.ContainerStop(ctx, ct.ID, container.StopOptions{Timeout: new(10)})
 		_ = r.docker.ContainerRemove(ctx, ct.ID, container.RemoveOptions{Force: true})
 	}
 	return nil
@@ -101,8 +116,7 @@ func (r *RuntimeClient) RemoveServiceContainers(ctx context.Context, serviceName
 
 // RemoveNamedContainer stops and removes a single container by name.
 func (r *RuntimeClient) RemoveNamedContainer(ctx context.Context, name string) error {
-	t := 10
-	_ = r.docker.ContainerStop(ctx, name, container.StopOptions{Timeout: &t})
+	_ = r.docker.ContainerStop(ctx, name, container.StopOptions{Timeout: new(10)})
 	return r.docker.ContainerRemove(ctx, name, container.RemoveOptions{Force: true})
 }
 
@@ -174,24 +188,35 @@ func (r *RuntimeClient) StreamLogs(
 	return ch, nil
 }
 
-func (r *RuntimeClient) Deploy(ctx context.Context, cmd *agentpb.CmdDeploy) (string, error) {
+func (r *RuntimeClient) Deploy(ctx context.Context, cmd *agentpb.CmdDeploy) (string, int32, error) {
 	out, err := r.docker.ImagePull(ctx, cmd.Image, image.PullOptions{})
 	if err != nil {
-		return "", fmt.Errorf("pull image %s: %w", cmd.Image, err)
+		return "", 0, fmt.Errorf("pull image %s: %w", cmd.Image, err)
 	}
 	defer func() { _ = out.Close() }()
 	if _, err := io.Copy(io.Discard, out); err != nil {
-		return "", fmt.Errorf("drain pull output: %w", err)
+		return "", 0, fmt.Errorf("drain pull output: %w", err)
 	}
 
 	portBindings := nat.PortMap{}
 	exposedPorts := nat.PortSet{}
+	var primaryContainerPort nat.Port
 	for _, p := range cmd.Ports {
 		cp := nat.Port(fmt.Sprintf("%d/%s", p.ContainerPort, p.Protocol))
 		exposedPorts[cp] = struct{}{}
-		if p.HostPort > 0 {
-			portBindings[cp] = []nat.PortBinding{{HostPort: fmt.Sprintf("%d", p.HostPort)}}
+		if primaryContainerPort == "" {
+			primaryContainerPort = cp
 		}
+		// Always publish, even with HostPort==0 — Docker auto-assigns a free
+		// host port in that case. This is what lets a worker-hosted service
+		// be reachable at all: unlike local (same-host) services, Traefik
+		// can't resolve the container by Docker network name across hosts,
+		// it needs worker_ip:host_port.
+		hostPort := ""
+		if p.HostPort > 0 {
+			hostPort = fmt.Sprintf("%d", p.HostPort)
+		}
+		portBindings[cp] = []nat.PortBinding{{HostPort: hostPort}}
 	}
 
 	resources := container.Resources{}
@@ -212,6 +237,12 @@ func (r *RuntimeClient) Deploy(ctx context.Context, cmd *agentpb.CmdDeploy) (str
 	containerName := fmt.Sprintf("tidefly_%s_%s", cmd.ProjectId, cmd.ServiceName)
 	_ = r.docker.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true})
 
+	if cmd.Network != "" {
+		if err := r.ensureNetwork(ctx, cmd.Network); err != nil {
+			return "", 0, fmt.Errorf("ensure network %q: %w", cmd.Network, err)
+		}
+	}
+
 	resp, err := r.docker.ContainerCreate(
 		ctx,
 		&container.Config{
@@ -228,10 +259,34 @@ func (r *RuntimeClient) Deploy(ctx context.Context, cmd *agentpb.CmdDeploy) (str
 		nil, nil, containerName,
 	)
 	if err != nil {
-		return "", fmt.Errorf("create container: %w", err)
+		return "", 0, fmt.Errorf("create container: %w", err)
 	}
 	if err := r.docker.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return "", fmt.Errorf("start container: %w", err)
+		return "", 0, fmt.Errorf("start container: %w", err)
 	}
-	return resp.ID[:12], nil
+
+	var assignedPort int32
+	if primaryContainerPort != "" {
+		assignedPort = r.readAssignedPort(ctx, resp.ID, primaryContainerPort)
+	}
+
+	return resp.ID[:12], assignedPort, nil
+}
+
+// readAssignedPort inspects a just-started container to find the host port
+// Docker actually bound the given container port to — needed because a
+// dynamic request (HostPort==0 at create time) doesn't tell us the result
+// until the container is running.
+func (r *RuntimeClient) readAssignedPort(ctx context.Context, containerID string, containerPort nat.Port) int32 {
+	info, err := r.docker.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return 0
+	}
+	bindings, ok := info.NetworkSettings.Ports[containerPort]
+	if !ok || len(bindings) == 0 {
+		return 0
+	}
+	var port int
+	_, _ = fmt.Sscanf(bindings[0].HostPort, "%d", &port)
+	return int32(port)
 }

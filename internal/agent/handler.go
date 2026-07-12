@@ -15,7 +15,6 @@ type CommandHandler struct {
 	cfg    *config.Config
 	stream agentpb.AgentService_ConnectClient
 	rt     *RuntimeClient
-	caddy  *CaddyClient
 }
 
 func NewCommandHandler(cfg *config.Config, stream agentpb.AgentService_ConnectClient) *CommandHandler {
@@ -23,7 +22,6 @@ func NewCommandHandler(cfg *config.Config, stream agentpb.AgentService_ConnectCl
 		cfg:    cfg,
 		stream: stream,
 		rt:     NewRuntimeClient(cfg.Runtime.Type, cfg.Runtime.SocketPath),
-		caddy:  NewCaddyClient(cfg.Caddy.AdminURL),
 	}
 }
 
@@ -62,12 +60,6 @@ func (h *CommandHandler) Handle(ctx context.Context, msg *agentpb.PlaneMessage) 
 
 	case *agentpb.PlaneMessage_CollectMetrics:
 		return h.handleCollectMetrics(ctx, msg.CommandId)
-
-	case *agentpb.PlaneMessage_RegisterRoute:
-		return h.handleRegisterRoute(ctx, msg.CommandId, p.RegisterRoute)
-
-	case *agentpb.PlaneMessage_RemoveRoute:
-		return h.handleRemoveRoute(ctx, msg.CommandId, p.RemoveRoute)
 
 	case *agentpb.PlaneMessage_Heal:
 		go h.handleHeal(ctx, msg.CommandId, p.Heal)
@@ -168,7 +160,7 @@ func (h *CommandHandler) handleStreamLogs(ctx context.Context, cmdID string, cmd
 // ── Deploy ────────────────────────────────────────────────────────────────────
 
 func (h *CommandHandler) handleDeploy(ctx context.Context, cmdID string, cmd *agentpb.CmdDeploy) {
-	containerID, err := h.rt.Deploy(ctx, cmd)
+	containerID, assignedPort, err := h.rt.Deploy(ctx, cmd)
 	if err != nil {
 		_ = h.stream.Send(&agentpb.AgentMessage{
 			MessageId: uuid.New().String(),
@@ -186,9 +178,10 @@ func (h *CommandHandler) handleDeploy(ctx context.Context, cmdID string, cmd *ag
 		MessageId: uuid.New().String(),
 		Payload: &agentpb.AgentMessage_DeployResult{
 			DeployResult: &agentpb.DeployResult{
-				CommandId:   cmdID,
-				Success:     true,
-				ContainerId: containerID,
+				CommandId:    cmdID,
+				Success:      true,
+				ContainerId:  containerID,
+				AssignedPort: assignedPort,
 			},
 		},
 	})
@@ -207,7 +200,7 @@ func (h *CommandHandler) handleHeal(ctx context.Context, cmdID string, cmd *agen
 	// Wait briefly before restart
 	time.Sleep(2 * time.Second)
 
-	containerID, err := h.rt.Deploy(ctx, cmd.Deploy)
+	containerID, assignedPort, err := h.rt.Deploy(ctx, cmd.Deploy)
 	if err != nil {
 		slog.Error("agent: self-heal failed", "service", cmd.ServiceName, "error", err)
 		_ = h.stream.Send(&agentpb.AgentMessage{
@@ -228,9 +221,10 @@ func (h *CommandHandler) handleHeal(ctx context.Context, cmdID string, cmd *agen
 		MessageId: uuid.New().String(),
 		Payload: &agentpb.AgentMessage_HealResult{
 			HealResult: &agentpb.HealResult{
-				CommandId:   cmdID,
-				Success:     true,
-				ContainerId: containerID,
+				CommandId:    cmdID,
+				Success:      true,
+				ContainerId:  containerID,
+				AssignedPort: assignedPort,
 			},
 		},
 	})
@@ -252,30 +246,23 @@ func (h *CommandHandler) handleBlueGreen(ctx context.Context, cmdID string, cmd 
 	deployCmd.ServiceName = newName
 	deployCmd.Labels["tidefly.slot"] = newSlot
 
-	containerID, err := h.rt.Deploy(ctx, deployCmd)
+	containerID, assignedPort, err := h.rt.Deploy(ctx, deployCmd)
 	if err != nil {
 		slog.Error("agent: blue-green deploy new slot failed", "service", cmd.ServiceName, "error", err)
-		_ = h.sendHealResult(cmdID, false, "", err.Error())
+		_ = h.sendHealResult(cmdID, false, "", 0, err.Error())
 		return
 	}
 
 	// Wait for container to be running
 	if err := h.waitRunning(ctx, newName, 60*time.Second); err != nil {
 		_ = h.rt.RemoveContainer(ctx, containerID, true)
-		_ = h.sendHealResult(cmdID, false, "", fmt.Sprintf("new container unhealthy: %s", err))
+		_ = h.sendHealResult(cmdID, false, "", 0, fmt.Sprintf("new container unhealthy: %s", err))
 		return
 	}
 
-	// Switch Caddy route if domain configured
-	if cmd.Domain != "" && h.cfg.Caddy.Enabled {
-		upstream := fmt.Sprintf("%s:%d", newName, cmd.Port)
-		if err := h.caddy.RegisterRoute(ctx, upstream, cmd.Domain, cmd.Tls); err != nil {
-			slog.Warn("agent: blue-green route switch failed", "error", err)
-			// Don't rollback — route failure is non-fatal, container is running
-		} else {
-			slog.Info("agent: blue-green route switched", "domain", cmd.Domain, "upstream", upstream)
-		}
-	}
+	// No explicit route switch needed — Traefik pulls its config from the
+	// Plane's HTTP Provider and picks up the new slot (and its assigned
+	// port, reported below) automatically once the DB reflects it as active.
 
 	// Remove old containers
 	oldName := cmd.ServiceName
@@ -287,7 +274,7 @@ func (h *CommandHandler) handleBlueGreen(ctx context.Context, cmdID string, cmd 
 	}
 
 	slog.Info("agent: blue-green complete", "service", cmd.ServiceName, "active_slot", newSlot)
-	_ = h.sendHealResult(cmdID, true, containerID, "")
+	_ = h.sendHealResult(cmdID, true, containerID, assignedPort, "")
 }
 
 // ── Rolling Update ────────────────────────────────────────────────────────────
@@ -297,11 +284,12 @@ func (h *CommandHandler) handleRollingUpdate(ctx context.Context, cmdID string, 
 
 	containers, err := h.rt.ListServiceContainers(ctx, cmd.ServiceName)
 	if err != nil {
-		_ = h.sendScaleResult(cmdID, false, 0, err.Error())
+		_ = h.sendScaleResult(cmdID, false, 0, nil, err.Error())
 		return
 	}
 
 	updated := 0
+	var assignedPorts []int32
 	for _, ct := range containers {
 		// Stop old
 		_ = h.rt.StopContainer(ctx, ct.Id, 10)
@@ -312,11 +300,13 @@ func (h *CommandHandler) handleRollingUpdate(ctx context.Context, cmdID string, 
 		if len(containers) > 1 {
 			deployCmd.ServiceName = fmt.Sprintf("%s-%d", cmd.ServiceName, updated+1)
 		}
-		if _, err := h.rt.Deploy(ctx, deployCmd); err != nil {
+		_, assignedPort, err := h.rt.Deploy(ctx, deployCmd)
+		if err != nil {
 			slog.Error("agent: rolling update failed", "service", cmd.ServiceName, "error", err)
-			_ = h.sendScaleResult(cmdID, false, int32(updated), err.Error())
+			_ = h.sendScaleResult(cmdID, false, int32(updated), assignedPorts, err.Error())
 			return
 		}
+		assignedPorts = append(assignedPorts, assignedPort)
 		updated++
 		time.Sleep(2 * time.Second)
 	}
@@ -325,15 +315,17 @@ func (h *CommandHandler) handleRollingUpdate(ctx context.Context, cmdID string, 
 	for updated < int(cmd.Replicas) {
 		deployCmd := cmd.Deploy
 		deployCmd.ServiceName = fmt.Sprintf("%s-%d", cmd.ServiceName, updated+1)
-		if _, err := h.rt.Deploy(ctx, deployCmd); err != nil {
-			_ = h.sendScaleResult(cmdID, false, int32(updated), err.Error())
+		_, assignedPort, err := h.rt.Deploy(ctx, deployCmd)
+		if err != nil {
+			_ = h.sendScaleResult(cmdID, false, int32(updated), assignedPorts, err.Error())
 			return
 		}
+		assignedPorts = append(assignedPorts, assignedPort)
 		updated++
 	}
 
 	slog.Info("agent: rolling update complete", "service", cmd.ServiceName, "replicas", updated)
-	_ = h.sendScaleResult(cmdID, true, int32(updated), "")
+	_ = h.sendScaleResult(cmdID, true, int32(updated), assignedPorts, "")
 }
 
 // ── Autoscale ─────────────────────────────────────────────────────────────────
@@ -344,6 +336,7 @@ func (h *CommandHandler) handleAutoscale(ctx context.Context, cmdID string, cmd 
 
 	current := int(cmd.CurrentReplicas)
 	target := int(cmd.TargetReplicas)
+	var assignedPorts []int32
 
 	if target > current {
 		// Scale up
@@ -351,18 +344,20 @@ func (h *CommandHandler) handleAutoscale(ctx context.Context, cmdID string, cmd 
 			deployCmd := cmd.Deploy
 			deployCmd.ServiceName = fmt.Sprintf("%s-%d", cmd.ServiceName, i)
 			deployCmd.Labels["tidefly.replica"] = fmt.Sprintf("%d", i)
-			if _, err := h.rt.Deploy(ctx, deployCmd); err != nil {
+			_, assignedPort, err := h.rt.Deploy(ctx, deployCmd)
+			if err != nil {
 				slog.Error("agent: autoscale up failed", "service", cmd.ServiceName, "replica", i, "error", err)
-				_ = h.sendScaleResult(cmdID, false, int32(i-1), err.Error())
+				_ = h.sendScaleResult(cmdID, false, int32(i-1), assignedPorts, err.Error())
 				return
 			}
-			slog.Info("agent: scaled up", "service", cmd.ServiceName, "replica", i)
+			assignedPorts = append(assignedPorts, assignedPort)
+			slog.Info("agent: scaled up", "service", cmd.ServiceName, "replica", i, "port", assignedPort)
 		}
 	} else if target < current {
 		// Scale down — remove highest numbered replicas first
 		containers, err := h.rt.ListServiceContainers(ctx, cmd.ServiceName)
 		if err != nil {
-			_ = h.sendScaleResult(cmdID, false, cmd.CurrentReplicas, err.Error())
+			_ = h.sendScaleResult(cmdID, false, cmd.CurrentReplicas, nil, err.Error())
 			return
 		}
 		toRemove := current - target
@@ -379,7 +374,7 @@ func (h *CommandHandler) handleAutoscale(ctx context.Context, cmdID string, cmd 
 		}
 	}
 
-	_ = h.sendScaleResult(cmdID, true, cmd.TargetReplicas, "")
+	_ = h.sendScaleResult(cmdID, true, cmd.TargetReplicas, assignedPorts, "")
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
@@ -408,28 +403,6 @@ func (h *CommandHandler) handleCollectMetrics(_ context.Context, cmdID string) e
 	)
 }
 
-// ── Routes ────────────────────────────────────────────────────────────────────
-
-func (h *CommandHandler) handleRegisterRoute(ctx context.Context, cmdID string, cmd *agentpb.CmdRegisterRoute) error {
-	if !h.cfg.Caddy.Enabled {
-		return h.sendAck(cmdID, false, "caddy is disabled on this worker")
-	}
-	if err := h.caddy.RegisterRoute(ctx, cmd.Upstream, cmd.Domain, cmd.Tls); err != nil {
-		return h.sendError(cmdID, "ROUTE_REGISTER_FAILED", err.Error())
-	}
-	return h.sendAck(cmdID, true, "")
-}
-
-func (h *CommandHandler) handleRemoveRoute(ctx context.Context, cmdID string, cmd *agentpb.CmdRemoveRoute) error {
-	if !h.cfg.Caddy.Enabled {
-		return h.sendAck(cmdID, false, "caddy is disabled on this worker")
-	}
-	if err := h.caddy.RemoveRoute(ctx, cmd.Domain); err != nil {
-		return h.sendError(cmdID, "ROUTE_REMOVE_FAILED", err.Error())
-	}
-	return h.sendAck(cmdID, true, "")
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func (h *CommandHandler) waitRunning(ctx context.Context, containerName string, timeout time.Duration) error {
@@ -453,29 +426,31 @@ func (h *CommandHandler) waitRunning(ctx context.Context, containerName string, 
 	return fmt.Errorf("container %q did not become running within %s", containerName, timeout)
 }
 
-func (h *CommandHandler) sendHealResult(cmdID string, success bool, containerID, errMsg string) error {
+func (h *CommandHandler) sendHealResult(cmdID string, success bool, containerID string, assignedPort int32, errMsg string) error {
 	return h.stream.Send(&agentpb.AgentMessage{
 		MessageId: uuid.New().String(),
 		Payload: &agentpb.AgentMessage_HealResult{
 			HealResult: &agentpb.HealResult{
-				CommandId:   cmdID,
-				Success:     success,
-				ContainerId: containerID,
-				Error:       errMsg,
+				CommandId:    cmdID,
+				Success:      success,
+				ContainerId:  containerID,
+				AssignedPort: assignedPort,
+				Error:        errMsg,
 			},
 		},
 	})
 }
 
-func (h *CommandHandler) sendScaleResult(cmdID string, success bool, replicas int32, errMsg string) error {
+func (h *CommandHandler) sendScaleResult(cmdID string, success bool, replicas int32, assignedPorts []int32, errMsg string) error {
 	return h.stream.Send(&agentpb.AgentMessage{
 		MessageId: uuid.New().String(),
 		Payload: &agentpb.AgentMessage_ScaleResult{
 			ScaleResult: &agentpb.ScaleResult{
-				CommandId: cmdID,
-				Success:   success,
-				Replicas:  replicas,
-				Error:     errMsg,
+				CommandId:     cmdID,
+				Success:       success,
+				Replicas:      replicas,
+				AssignedPorts: assignedPorts,
+				Error:         errMsg,
 			},
 		},
 	})
