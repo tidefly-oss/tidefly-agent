@@ -179,6 +179,7 @@ func (a *Agent) connect(ctx context.Context) error {
 
 	slog.Info("agent: stream opened, sending hello")
 
+	cores, memMB := capacity()
 	if err := stream.Send(
 		&agentpb.AgentMessage{
 			MessageId: uuid.New().String(),
@@ -190,6 +191,8 @@ func (a *Agent) connect(ctx context.Context) error {
 					Arch:         runtime.GOARCH,
 					RuntimeType:  a.cfg.Runtime.Type,
 					Hostname:     a.cfg.Agent.Name,
+					CpuCores:     cores,
+					MemTotalMb:   memMB,
 				},
 			},
 		},

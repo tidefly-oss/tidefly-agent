@@ -54,7 +54,31 @@ chmod 700 "$CONFIG_DIR"
 
 # ── Generate .env ─────────────────────────────────────────────────────────────
 if [ -f "$ENV_FILE" ]; then
-  warn "Config already exists at $ENV_FILE — skipping generation"
+  warn "Config already exists at $ENV_FILE"
+  # An explicitly-passed PLANE_TOKEN means the operator wants to
+  # (re-)register — e.g. after the Plane's CA was rotated/reset and the
+  # agent's existing certs no longer validate. Update the token (and
+  # endpoint, in case that changed too) in place rather than silently
+  # keeping the stale one.
+  if [ -n "${PLANE_TOKEN:-}" ]; then
+    info "Updating PLANE_TOKEN in existing config"
+    tmp_env="$(mktemp)"
+    awk -v tok="$PLANE_TOKEN" '
+      /^PLANE_TOKEN=/ { print "PLANE_TOKEN=" tok; next }
+      { print }
+    ' "$ENV_FILE" > "$tmp_env"
+    mv "$tmp_env" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+  fi
+  if [ -n "${PLANE_ENDPOINT:-}" ]; then
+    tmp_env="$(mktemp)"
+    awk -v ep="$PLANE_ENDPOINT" '
+      /^PLANE_ENDPOINT=/ { print "PLANE_ENDPOINT=" ep; next }
+      { print }
+    ' "$ENV_FILE" > "$tmp_env"
+    mv "$tmp_env" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+  fi
 else
   AGENT_ID=""
   if [ -f /proc/sys/kernel/random/uuid ]; then
