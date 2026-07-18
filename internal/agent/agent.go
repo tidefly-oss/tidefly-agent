@@ -39,12 +39,24 @@ func New(cfg *config.Config, version string) (*Agent, error) {
 }
 
 func (a *Agent) Run(ctx context.Context) error {
-	if !a.cfg.IsRegistered() {
-		slog.Info("agent: not registered, starting registration")
+	// A non-empty PLANE_TOKEN is an explicit instruction to (re-)register —
+	// most commonly used to recover a worker after the Plane's CA was
+	// rotated or the DB was reset, where stale local certs would otherwise
+	// silently keep being used and fail TLS validation against the new CA
+	// with a confusing "signed by unknown authority" error instead of a
+	// clear re-registration.
+	if a.cfg.Plane.Token != "" {
+		if a.cfg.IsRegistered() {
+			slog.Info("agent: PLANE_TOKEN present — forcing re-registration (discarding existing certs)")
+		} else {
+			slog.Info("agent: not registered, starting registration")
+		}
 		if err := a.register(ctx); err != nil {
 			return fmt.Errorf("registration failed: %w", err)
 		}
 		slog.Info("agent: registration complete")
+	} else if !a.cfg.IsRegistered() {
+		return fmt.Errorf("agent has no certs and no PLANE_TOKEN was provided — set PLANE_TOKEN to register")
 	}
 
 	go a.startRenewalLoop(ctx)
